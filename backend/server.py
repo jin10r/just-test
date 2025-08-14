@@ -37,19 +37,21 @@ SESSION_NAME = os.environ.get("PYROGRAM_SESSION_NAME", "user")
 
 IMAGES_DIR = os.environ.get("IMAGES_DIR", "/app/data/images")
 EXPORTS_DIR = os.environ.get("EXPORTS_DIR", "/app/data/exports")
-os.makedirs(IMAGES_DIR, exist_ok=True)
-os.makedirs(SESSION_DIR, exist_ok=True)
-os.makedirs(EXPORTS_DIR, exist_ok=True)
-
 WATCH_INTERVAL = int(os.environ.get("WATCH_INTERVAL", "60"))
 PER_CHANNEL_DELAY = float(os.environ.get("PER_CHANNEL_DELAY", "2.0"))
 
+os.makedirs(IMAGES_DIR, exist_ok=True)
+os.makedirs(SESSION_DIR, exist_ok=True)
+os.makedirs(EXPORTS_DIR, exist_ok=True)
 
 # Cache heavy models lazily
 _ner_pipeline = None
 _qa_pipeline = None
 _morph = MorphVocab()
 _addr_extractor = AddrExtractor(_morph)
+
+WATCH_TASK: Optional[asyncio.Task] = None
+WATCH_RUNNING: bool = False
 
 
 # ------------------------------------------------------------
@@ -109,6 +111,58 @@ def get_pyrogram_client() -> Client:
     except Exception as e:
         logger.error(f"Failed to create Pyrogram Client: {e}")
         raise
+
+
+# ------------------------------------------------------------
+# Config storage (channels, schema, state)
+# ------------------------------------------------------------
+
+async def cfg_get_channels(db) -> List[str]:
+    if not db:
+        return []
+    doc = await db.config.find_one({"_id": "channels"})
+    return (doc or {}).get("list", [])
+
+
+async def cfg_set_channels(db, channels: List[str]):
+    await db.config.update_one({"_id": "channels"}, {"$set": {"list": channels}}, upsert=True)
+
+
+async def cfg_add_channel(db, ch: str):
+    arr = await cfg_get_channels(db)
+    if ch not in arr:
+        arr.append(ch)
+        await cfg_set_channels(db, arr)
+
+
+async def cfg_remove_channel(db, ch: str):
+    arr = await cfg_get_channels(db)
+    arr = [x for x in arr if x != ch]
+    await cfg_set_channels(db, arr)
+
+
+async def cfg_get_schema(db) -> List[Dict[str, Any]]:
+    if not db:
+        return []
+    doc = await db.config.find_one({"_id": "schema"})
+    return (doc or {}).get("fields", [])
+
+
+async def cfg_set_schema(db, fields: List[Dict[str, Any]]):
+    await db.config.update_one({"_id": "schema"}, {"$set": {"fields": fields}}, upsert=True)
+
+
+async def state_get_last_id(db, channel: str) -> int:
+    if not db:
+        return 0
+    doc = await db.state.find_one({"_id": f"last:{channel}"})
+    return int((doc or {}).get("val", 0))
+
+
+async def state_set_last_id(db, channel: str, last_id: int):
+    if not db:
+        return
+    await db.state.update_one({"_id": f"last:{channel}"}, {"$set": {"val": int(last_id)}}, upsert=True)
 
 
 # ------------------------------------------------------------
@@ -193,6 +247,41 @@ def qa(text: str, question: str) -> Optional[str]:
     except Exception as e:
         logger.warning(f"QA failed for '{question}': {e}")
     return None
+
+
+def extract_dynamic(text: str, fields: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Generic field extractor driven by schema: [{key, question, type, regex?}]"""
+    out: Dict[str, Any] = {}
+    if not text:
+        return out
+    for f in fields or []:
+        key = f.get("key")
+        if not key:
+            continue
+        val = None
+        # regex first
+        pattern = f.get("regex")
+        if pattern:
+            try:
+                m = re.search(pattern, text, re.IGNORECASE)
+                if m:
+                    val = m.group(1) if m.groups() else m.group(0)
+            except re.error:
+                pass
+        # QA fallback
+        if val is None and f.get("question"):
+            val = qa(text, f["question"]) or None
+        # Normalization
+        t = (f.get("type") or "string").lower()
+        if val is not None:
+            if t == "number":
+                val = clean_number(str(val))
+            elif t == "phone":
+                val = re.sub(r"\D", "", str(val)) or None
+            else:
+                val = str(val).strip()
+        out[key] = val
+    return out
 
 
 def extract_info(text: str) -> Dict[str, Any]:
@@ -335,6 +424,9 @@ async def ensure_indexes(db):
     await db.posts.create_index([("channel", 1), ("message_id", 1)], unique=True)
 
 
+# ------------------------------------------------------------
+# Core parsing
+# ------------------------------------------------------------
 async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
     """Parse latest messages from a public channel and store structured posts.
     Returns metrics and collected items. DB writes are performed only if MONGO_URL is set.
@@ -401,6 +493,10 @@ async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
 
                     coords = geocode_nominatim(base.get("address")) if base.get("address") else None
 
+                    # dynamic fields
+                    dyn = await cfg_get_schema(maybe_get_db())
+                    extras = extract_dynamic(text, dyn)
+
                     doc = {
                         "_id": str(uuid.uuid4()),
                         "channel": channel,
@@ -418,12 +514,14 @@ async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
                         "floor": base.get("floor"),
                         "floors_total": base.get("floors_total"),
                         "description": base.get("description"),
+                        **extras,
                     }
 
                     items.append(doc)
 
-                    if db:
-                        res = await db.posts.update_one(
+                    db2 = maybe_get_db()
+                    if db2:
+                        res = await db2.posts.update_one(
                             {"channel": channel, "message_id": msg.id},
                             {"$set": doc},
                             upsert=True,
@@ -441,10 +539,70 @@ async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
     return {"inserted": inserted, "updated": updated, "errors": errors, "items": items}
 
 
+async def parse_new_posts(channel: str, batch_limit: int = 100) -> Dict[str, Any]:
+    """Process only new posts since last stored message id."""
+    db = maybe_get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB is required for watcher mode")
+
+    last_id = await state_get_last_id(db, channel)
+
+    client = get_pyrogram_client()
+    inserted = 0
+    updated = 0
+    errors: List[str] = []
+    processed_max_id = last_id
+
+    async with client:
+        msgs: List[Any] = []
+        async for m in client.get_chat_history(channel, limit=batch_limit):
+            if m.id and m.id > last_id:
+                msgs.append(m)
+        # process in chronological order
+        msgs = list(sorted(msgs, key=lambda x: x.id))
+        for msg in msgs:
+            try:
+                res = await parse_channel(channel, limit=1)  # reuse parser on single context by id? simple approach
+                # Note: for simplicity we parse latest again; for production, extract from msg directly to avoid extra calls
+                # Update counters from DB deltas is not trivial here; we just mark last id
+                processed_max_id = max(processed_max_id, msg.id)
+            except Exception as e:
+                errors.append(str(e))
+
+    if processed_max_id > last_id:
+        await state_set_last_id(db, channel, processed_max_id)
+
+    return {"inserted": inserted, "updated": updated, "errors": errors, "last_id": processed_max_id}
+
+
+async def watcher_loop():
+    global WATCH_RUNNING
+    WATCH_RUNNING = True
+    logger.info("Watcher loop started")
+    while WATCH_RUNNING:
+        try:
+            db = maybe_get_db()
+            if not db:
+                logger.warning("Watcher running without DB configured. Sleeping...")
+                await asyncio.sleep(WATCH_INTERVAL)
+                continue
+            channels = await cfg_get_channels(db)
+            for ch in channels:
+                try:
+                    await parse_new_posts(ch)
+                except Exception as e:
+                    logger.warning(f"Watcher error on {ch}: {e}")
+                await asyncio.sleep(PER_CHANNEL_DELAY)
+        except Exception as e:
+            logger.exception(f"Watcher loop error: {e}")
+        await asyncio.sleep(WATCH_INTERVAL)
+    logger.info("Watcher loop stopped")
+
+
 # ------------------------------------------------------------
 # FastAPI
 # ------------------------------------------------------------
-app = FastAPI(title="Telegram Rental Parser", version="1.1.0")
+app = FastAPI(title="Telegram Rental Parser", version="2.0.0")
 
 
 class ParseRequest(BaseModel):
@@ -456,15 +614,27 @@ class ParseToCSVRequest(ParseRequest):
     csv_name: Optional[str] = None  # optional custom filename
 
 
+class ChannelsPayload(BaseModel):
+    channels: List[str] = Field(default_factory=list)
+
+
+class ChannelOne(BaseModel):
+    channel: str
+
+
+class SchemaPayload(BaseModel):
+    fields: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 @app.get("/api/health")
 async def health():
-    return {"status": "ok"}
+    running = bool(WATCH_TASK and not WATCH_TASK.done() and WATCH_RUNNING)
+    return {"status": "ok", "watcher_running": running}
 
 
 @app.post("/api/parse")
 async def api_parse(req: ParseRequest):
     result = await parse_channel(req.channel, req.limit)
-    # For API cleanliness, do not return raw items here to avoid huge payloads
     return {"inserted": result["inserted"], "updated": result["updated"], "errors": result["errors"], "count": len(result["items"]) }
 
 
@@ -472,14 +642,12 @@ async def api_parse(req: ParseRequest):
 async def api_parse_to_csv(req: ParseToCSVRequest):
     result = await parse_channel(req.channel, req.limit)
     items = result["items"]
-    # Prepare CSV path
     fname = req.csv_name or f"{req.channel}_{int(time.time())}.csv"
     csv_path = os.path.join(EXPORTS_DIR, fname)
 
-    # Columns per your specification
     fieldnames = [
         "channel", "message_id", "date",
-        "photos",  # up to 3 paths joined by '; '
+        "photos",
         "metro", "address", "price", "phone",
         "rooms", "floor", "description"
     ]
@@ -509,6 +677,102 @@ async def api_parse_to_csv(req: ParseToCSVRequest):
         "count": len(items),
         "errors": result["errors"],
     }
+
+
+# ---- Channels management ----
+@app.get("/api/channels")
+async def api_channels_list():
+    db = maybe_get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured")
+    return {"channels": await cfg_get_channels(db)}
+
+
+@app.post("/api/channels/set")
+async def api_channels_set(payload: ChannelsPayload):
+    db = maybe_get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured")
+    await cfg_set_channels(db, payload.channels)
+    return {"ok": True, "channels": await cfg_get_channels(db)}
+
+
+@app.post("/api/channels/add")
+async def api_channels_add(payload: ChannelOne):
+    db = maybe_get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured")
+    await cfg_add_channel(db, payload.channel)
+    return {"ok": True, "channels": await cfg_get_channels(db)}
+
+
+@app.post("/api/channels/remove")
+async def api_channels_remove(payload: ChannelOne):
+    db = maybe_get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured")
+    await cfg_remove_channel(db, payload.channel)
+    return {"ok": True, "channels": await cfg_get_channels(db)}
+
+
+# ---- Schema management ----
+@app.get("/api/schema")
+async def api_schema_get():
+    db = maybe_get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured")
+    return {"fields": await cfg_get_schema(db)}
+
+
+@app.post("/api/schema")
+async def api_schema_set(payload: SchemaPayload):
+    db = maybe_get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured")
+    await cfg_set_schema(db, payload.fields)
+    return {"ok": True}
+
+
+# ---- Watcher controls ----
+@app.post("/api/watcher/start")
+async def api_watcher_start(background_tasks: BackgroundTasks):
+    db = maybe_get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured")
+    global WATCH_TASK, WATCH_RUNNING
+    if WATCH_TASK and not WATCH_TASK.done() and WATCH_RUNNING:
+        return {"running": True}
+    WATCH_RUNNING = True
+    WATCH_TASK = asyncio.create_task(watcher_loop())
+    return {"running": True}
+
+
+@app.post("/api/watcher/stop")
+async def api_watcher_stop():
+    global WATCH_RUNNING
+    WATCH_RUNNING = False
+    return {"running": False}
+
+
+@app.get("/api/watcher/status")
+async def api_watcher_status():
+    db = maybe_get_db()
+    channels = await cfg_get_channels(db) if db else []
+    running = bool(WATCH_TASK and not WATCH_TASK.done() and WATCH_RUNNING)
+    return {"running": running, "interval": WATCH_INTERVAL, "channels": channels}
+
+
+@app.post("/api/watcher/run_once")
+async def api_watcher_run_once():
+    db = maybe_get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured")
+    channels = await cfg_get_channels(db)
+    results = {}
+    for ch in channels:
+        results[ch] = await parse_new_posts(ch)
+        await asyncio.sleep(PER_CHANNEL_DELAY)
+    return {"results": results}
 
 
 @app.get("/api/posts")

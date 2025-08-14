@@ -1,0 +1,37 @@
+version: "3.9"
+services:
+  mongo:
+    image: mongo:6
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - MONGO_URL=mongodb://mongo:27017/tg_parser
+      - MONGO_DB_NAME=tg_parser
+      - PYROGRAM_SESSION_DIR=/sessions
+      - PYROGRAM_SESSION_NAME=user
+      - IMAGES_DIR=/data/images
+      - EXPORTS_DIR=/data/exports
+      - WATCH_INTERVAL=60
+      - PER_CHANNEL_DELAY=2.0
+      # - TG_API_ID= # если потребуется
+      # - TG_API_HASH=
+      # - NOMINATIM_EMAIL=you@example.com
+    volumes:
+      - ./sessions:/sessions
+      - ./data/images:/data/images
+      - ./data/exports:/data/exports
+    ports:
+      - "8001:8001"
+    depends_on:
+      - mongo
+    restart: unless-stopped
+
+volumes:
+  mongo_data:

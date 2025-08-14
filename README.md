@@ -1,42 +1,64 @@
-# Telegram Rental Parser (Pyrogram + ruBERT + FastAPI)
+# Telegram Rental Parser (Watcher + Dynamic Schema)
 
-Парсер постов телеграм-каналов на русском языке. Извлекает:
-- до 3 фото
-- станция метро
-- адрес (с геокодированием через Nominatim)
-- цена
-- телефон
-- количество комнат
-- этаж
-- остальное описание
+Функционал:
+- Парсинг телеграм-каналов через Pyrogram (user session)
+- Извлечение параметров из неструктурированного caption: рукописные правила + BERT QA
+- Геокодирование через Nominatim
+- До 3 фото с поста
+- Хранение в MongoDB (UUID как id), CSV экспорт по запросу
+- Мониторинг списка каналов (watcher) с REST-управлением
+- Динамический список полей извлечения (schema), задаётся через API
+- Docker Compose деплой (backend + Mongo)
 
-Технологии: Pyrogram (готовая user session), ruBERT tiny NER, Natasha, FastAPI. БД: MongoDB (по env), при её отсутствии можно выгружать в CSV.
-
-## Переменные окружения
-- MONGO_URL — строка подключения MongoDB (если нет — запись в БД пропускается)
-- MONGO_DB_NAME — имя базы (по умолчанию tg_parser)
-- PYROGRAM_SESSION_DIR — папка с сессией (по умолчанию /app/sessions)
-- PYROGRAM_SESSION_NAME — имя файла сессии без расширения (по умолчанию user)
-- IMAGES_DIR — путь для сохранения изображений (по умолчанию /app/data/images)
-- EXPORTS_DIR — путь для CSV (по умолчанию /app/data/exports)
-- NOMINATIM_EMAIL — опционально, попадёт в User-Agent для Nominatim
-- TG_API_ID / TG_API_HASH — опционально, если Pyrogram в окружении требует app credentials
-
-## API (префикс /api)
-- GET /api/health
-- POST /api/parse {"channel": "arendakv_msk", "limit": 30}
-  - возвращает {inserted, updated, count, errors}, элементы не возвращает (чтобы не грузить ответ)
-- POST /api/parse_to_csv {"channel": "arendakv_msk", "limit": 30, "csv_name": "optional.csv"}
-  - парсит, пишет CSV в EXPORTS_DIR и возвращает путь
-- GET /api/posts — читает из БД, если MONGO_URL задан
-
-## CLI
+Быстрый старт (docker-compose)
+1) Создайте папки и положите user session:
 ```
-python3 scripts/parse_cli.py https://t.me/arendakv_msk --limit 30
+mkdir -p sessions data/images data/exports
+# положите сюда sessions/user.session
+```
+2) Запустите:
+```
+docker-compose up --build -d
+```
+3) Проверьте здоровье:
+```
+curl http://localhost:8001/api/health
 ```
 
-## Сессия Pyrogram
-Положите готовый user session файл в `${PYROGRAM_SESSION_DIR}/${PYROGRAM_SESSION_NAME}.session`.
+Управление каналами
+- GET /api/channels -> {channels}
+- POST /api/channels/set {"channels":["arendakv_msk","another_channel"]}
+- POST /api/channels/add {"channel":"arendakv_msk"}
+- POST /api/channels/remove {"channel":"arendakv_msk"}
 
-## CSV формат
-Столбцы: channel, message_id, date, photos (до 3 путей, разделены "; "), metro, address, price, phone, rooms, floor, description.
+Управление watcher
+- POST /api/watcher/start
+- POST /api/watcher/stop
+- GET  /api/watcher/status
+- POST /api/watcher/run_once (однократный обход всех каналов)
+
+Схема динамических полей
+- GET /api/schema -> {fields: [...]}
+- POST /api/schema {"fields":[{"key":"deposit","question":"Какой залог?","type":"number"}]}
+  - type: string|number|phone, regex (опционально) — если указан, сначала применяется regex, затем QA
+
+Парсинг и CSV
+- POST /api/parse {"channel":"arendakv_msk","limit":30}
+- POST /api/parse_to_csv {"channel":"arendakv_msk","limit":30,"csv_name":"rent.csv"}
+
+Переменные окружения (важное)
+- MONGO_URL=mongodb://mongo:27017/tg_parser
+- MONGO_DB_NAME=tg_parser
+- PYROGRAM_SESSION_DIR=/sessions
+- PYROGRAM_SESSION_NAME=user
+- IMAGES_DIR=/data/images
+- EXPORTS_DIR=/data/exports
+- WATCH_INTERVAL=60, PER_CHANNEL_DELAY=2.0
+- NOMINATIM_EMAIL=you@example.com (желательно)
+- RU_QA_MODEL=DeepPavlov/rubert-base-cased-squad (по умолчанию)
+- TG_API_ID/TG_API_HASH — если сессии этого требуют
+
+Примечания
+- Для корректной работы Pyrogram используйте валидную user session в папке sessions.
+- Watcher хранит last_message_id в коллекции state.
+- Индекс в posts: уникальная пара (channel, message_id).
