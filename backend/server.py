@@ -466,31 +466,39 @@ async def process_message(channel: str, msg, client: Client, db) -> Dict[str, An
     dyn_fields = await cfg_get_schema(db) if db else []
     extras = extract_dynamic(text, dyn_fields)
 
-    doc = {
-        "_id": str(uuid.uuid4()),
-        "channel": channel,
-        "message_id": msg.id,
-        "date": msg.date.isoformat() if msg.date else None,
-        "text": text or None,
-        "photo_paths": photo_paths,
-        "metro": base.get("metro"),
+    # Build property document according to your properties schema
+    title = base.get("address") or base.get("metro") or (text[:140] if text else None)
+    if coords:
+        location = {"type": "Point", "coordinates": [coords["lon"], coords["lat"]]}
+    else:
+        location = None
+
+    property_doc = {
+        "id": str(uuid.uuid4()),
+        "title": title or "Объявление",
+        "price": base.get("price") or 0,
+        "location": location or {"type": "Point", "coordinates": [0.0, 0.0]},
+        # optional fields we add (ваши валидаторы их допустят)
+        "metro_station": base.get("metro"),
         "address": base.get("address"),
-        "coords": coords,
         "phone": base.get("phone"),
-        "price": base.get("price"),
-        "currency": "RUB" if base.get("price") else None,
         "rooms": base.get("rooms"),
         "floor": base.get("floor"),
         "floors_total": base.get("floors_total"),
         "description": base.get("description"),
+        "photos": photo_paths,
+        "channel": channel,
+        "message_id": msg.id,
         **extras,
+        "created_at": msg.date.isoformat() if msg.date else None,
     }
 
     if db:
-        res = await db.posts.update_one({"channel": channel, "message_id": msg.id}, {"$set": doc}, upsert=True)
-        return {"doc": doc, "inserted": int(bool(res.upserted_id)), "updated": res.modified_count}
+        # Write into properties collection as required
+        res = await db.properties.update_one({"channel": channel, "message_id": msg.id}, {"$set": property_doc}, upsert=True)
+        return {"doc": property_doc, "inserted": int(bool(res.upserted_id)), "updated": res.modified_count}
     else:
-        return {"doc": doc, "inserted": 0, "updated": 0}
+        return {"doc": property_doc, "inserted": 0, "updated": 0}
 
 
 # ------------------------------------------------------------
