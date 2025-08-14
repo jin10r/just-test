@@ -217,10 +217,16 @@ def extract_info(text: str) -> Dict[str, Any]:
         if maybe and len(maybe) <= 40:
             metro = maybe
 
-    # Phone
+    # Phone (regex + QA) — нормализуем цифры
     p = PHONE_RE.search(text)
     if p:
-        phone = re.sub(r"\D", "", p.group(0))  # normalized digits
+        phone = re.sub(r"\D", "", p.group(0))
+    if not phone:
+        maybe_phone = qa(text, "Какой номер телефона?") or qa(text, "Контактный телефон?")
+        if maybe_phone:
+            phone = re.sub(r"\D", "", maybe_phone)
+            if not phone:
+                phone = None
 
     # Price (regex + QA) — извлекаем только число
     pr = PRICE_RE.search(text)
