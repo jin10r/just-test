@@ -43,6 +43,7 @@ os.makedirs(EXPORTS_DIR, exist_ok=True)
 
 # Cache heavy models lazily
 _ner_pipeline = None
+_qa_pipeline = None
 _morph = MorphVocab()
 _addr_extractor = AddrExtractor(_morph)
 
