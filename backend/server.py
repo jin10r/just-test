@@ -39,6 +39,7 @@ IMAGES_DIR = os.environ.get("IMAGES_DIR", "/app/data/images")
 EXPORTS_DIR = os.environ.get("EXPORTS_DIR", "/app/data/exports")
 WATCH_INTERVAL = int(os.environ.get("WATCH_INTERVAL", "60"))
 PER_CHANNEL_DELAY = float(os.environ.get("PER_CHANNEL_DELAY", "2.0"))
+WATCH_AUTOSTART = os.environ.get("WATCH_AUTOSTART", "false").lower() in {"1", "true", "yes"}
 
 os.makedirs(IMAGES_DIR, exist_ok=True)
 os.makedirs(SESSION_DIR, exist_ok=True)
@@ -172,7 +173,7 @@ PHONE_RE = re.compile(r"(\+7|8)\s*[\(\-\s]?\d{3}[\)\-\s]?\s?\d{3}[\-\s]?\d{2}[\-
 PRICE_RE = re.compile(r"(?:(?:цена|стоимость|арендная\s*плата)[:\s]*)?(\d[\d\s]{3,})(?:\s*(?:₽|руб(?:\.|лей|ля)?|р\.?))?", re.IGNORECASE)
 METRO_RE = re.compile(r"(?:\bм\.?|метро)\s*[:\-]?\s*([А-ЯЁа-яё\- ]{2,})")
 ROOMS_RE_NUM = re.compile(r"(\d+)\s*[- ]?(?:к(?!\w)|комнатн)\w*", re.IGNORECASE)
-# word forms: однокомнатная, двухкомнатная, трехкомнатная, четырёхкомнатная и т.п.
+# word forms
 ROOMS_WORDS = {
     "однокомнат": 1,
     "двухкомнат": 2,
@@ -182,7 +183,7 @@ ROOMS_WORDS = {
     "четырёхкомнат": 4,
     "пятикомнат": 5,
 }
-# floor patterns: "3/9 этаж", "этаж 2/5", "на 8 этаже", "этаж: 3 из 12"
+# floor patterns
 FLOOR_PAIR_RE = re.compile(r"(\d+)\s*[/\\|]\s*(\d+)\s*этаж", re.IGNORECASE)
 FLOOR_IN_RE = re.compile(r"(?:этаж[:\s]*|на\s+)(\d+)(?:\s*(?:из|/|\\)\s*(\d+))?\s*этаж?", re.IGNORECASE)
 
@@ -212,7 +213,6 @@ def extract_rooms(text: str) -> Optional[int]:
     for key, val in ROOMS_WORDS.items():
         if key in low:
             return val
-    # patterns like "2к", "3 кк"
     m2 = re.search(r"(\d+)\s*кк?\b", low)
     if m2:
         return clean_number(m2.group(1))
@@ -228,7 +228,6 @@ def extract_floor(text: str) -> Dict[str, Optional[int]]:
     m2 = FLOOR_IN_RE.search(text)
     if m2:
         return {"floor": clean_number(m2.group(1)), "floors_total": clean_number(m2.group(2)) if m2.group(2) else None}
-    # sometimes "этаж 5" without word этаж after
     m3 = re.search(r"этаж\s*(\d+)", text, re.IGNORECASE)
     if m3:
         return {"floor": clean_number(m3.group(1)), "floors_total": None}
@@ -259,7 +258,6 @@ def extract_dynamic(text: str, fields: List[Dict[str, Any]]) -> Dict[str, Any]:
         if not key:
             continue
         val = None
-        # regex first
         pattern = f.get("regex")
         if pattern:
             try:
@@ -268,10 +266,8 @@ def extract_dynamic(text: str, fields: List[Dict[str, Any]]) -> Dict[str, Any]:
                     val = m.group(1) if m.groups() else m.group(0)
             except re.error:
                 pass
-        # QA fallback
         if val is None and f.get("question"):
             val = qa(text, f["question"]) or None
-        # Normalization
         t = (f.get("type") or "string").lower()
         if val is not None:
             if t == "number":
@@ -301,7 +297,6 @@ def extract_info(text: str) -> Dict[str, Any]:
             "floors_total": None,
         }
 
-    # Metro (regex + QA fallback)
     m = METRO_RE.search(text)
     if m:
         metro = m.group(1).strip().strip("-:.")
@@ -310,7 +305,6 @@ def extract_info(text: str) -> Dict[str, Any]:
         if maybe and len(maybe) <= 40:
             metro = maybe
 
-    # Phone (regex + QA) — нормализуем цифры
     p = PHONE_RE.search(text)
     if p:
         phone = re.sub(r"\D", "", p.group(0))
@@ -321,7 +315,6 @@ def extract_info(text: str) -> Dict[str, Any]:
             if not phone:
                 phone = None
 
-    # Price (regex + QA) — извлекаем только число
     pr = PRICE_RE.search(text)
     if pr:
         price_val = clean_number(pr.group(1))
@@ -330,21 +323,18 @@ def extract_info(text: str) -> Dict[str, Any]:
         if maybe_price:
             price_val = clean_number(maybe_price)
 
-    # Address via Natasha first, then QA fallback
     address = extract_address_with_natasha(text)
     if not address:
         maybe_addr = qa(text, "Какой адрес?") or qa(text, "Укажите адрес объекта")
         if maybe_addr and len(maybe_addr) >= 6:
             address = maybe_addr
 
-    # Fallback: rule-based – pick line containing address markers
     if not address:
         for line in text.splitlines():
             if re.search(r"(ул\.|улица|пр\-кт|проспект|просп\.|бульвар|бул\.|переулок|пер\.|шоссе|ш\.|дом|д\.)", line, re.IGNORECASE):
                 address = line.strip()
                 break
 
-    # Rooms and Floor
     rooms = extract_rooms(text)
     if rooms is None:
         maybe_rooms = qa(text, "Сколько комнат?") or qa(text, "Количество комнат?")
@@ -357,7 +347,6 @@ def extract_info(text: str) -> Dict[str, Any]:
         if maybe_floor:
             floor_info["floor"] = clean_number(maybe_floor)
 
-    # Description: remove extracted items from text roughly
     desc = text
     if m:
         desc = desc.replace(m.group(0), "")
@@ -384,7 +373,6 @@ def extract_info(text: str) -> Dict[str, Any]:
 # ---------- Nominatim Geocoding ----------
 
 def geocode_nominatim(address: str) -> Optional[Dict[str, float]]:
-    """Geocode using OpenStreetMap Nominatim (no API key required)."""
     if not address:
         return None
     email = os.environ.get("NOMINATIM_EMAIL")
@@ -425,12 +413,88 @@ async def ensure_indexes(db):
 
 
 # ------------------------------------------------------------
-# Core parsing
+# Core parsing for a single message
+# ------------------------------------------------------------
+async def process_message(channel: str, msg, client: Client, db) -> Dict[str, Any]:
+    text = (msg.caption or msg.text or "").strip()
+
+    # Collect up to 3 photos
+    photo_paths: List[str] = []
+    if msg.media_group_id:
+        try:
+            grp = await client.get_media_group(chat_id=msg.chat.id, message_id=msg.id)
+            for m in grp:
+                if m.photo:
+                    path = await client.download_media(m, file_name=os.path.join(IMAGES_DIR, f"{uuid.uuid4()}.jpg"))
+                    if path:
+                        photo_paths.append(path)
+                    if len(photo_paths) >= 3:
+                        break
+            if not text:
+                for m in grp:
+                    if (m.caption or m.text):
+                        text = (m.caption or m.text).strip()
+                        break
+        except Exception as e:
+            logger.warning(f"Failed to process media group {msg.media_group_id}: {e}")
+    else:
+        if getattr(msg, "photo", None):
+            try:
+                path = await client.download_media(msg, file_name=os.path.join(IMAGES_DIR, f"{uuid.uuid4()}.jpg"))
+                if path:
+                    photo_paths.append(path)
+            except Exception as e:
+                logger.warning(f"Photo download error for message {msg.id}: {e}")
+
+    base = extract_info(text)
+
+    # NER enrichment if address missing
+    try:
+        if not base.get("address") and text:
+            ner = load_ner_pipeline()
+            ents = ner(text)
+            locs = [e["word"] for e in ents if e.get("entity_group") in {"LOC"}]
+            if locs:
+                base["address"] = " ".join(locs)
+    except Exception as e:
+        logger.warning(f"NER enrichment failed: {e}")
+
+    coords = geocode_nominatim(base.get("address")) if base.get("address") else None
+
+    dyn_fields = await cfg_get_schema(db) if db else []
+    extras = extract_dynamic(text, dyn_fields)
+
+    doc = {
+        "_id": str(uuid.uuid4()),
+        "channel": channel,
+        "message_id": msg.id,
+        "date": msg.date.isoformat() if msg.date else None,
+        "text": text or None,
+        "photo_paths": photo_paths,
+        "metro": base.get("metro"),
+        "address": base.get("address"),
+        "coords": coords,
+        "phone": base.get("phone"),
+        "price": base.get("price"),
+        "currency": "RUB" if base.get("price") else None,
+        "rooms": base.get("rooms"),
+        "floor": base.get("floor"),
+        "floors_total": base.get("floors_total"),
+        "description": base.get("description"),
+        **extras,
+    }
+
+    if db:
+        res = await db.posts.update_one({"channel": channel, "message_id": msg.id}, {"$set": doc}, upsert=True)
+        return {"doc": doc, "inserted": int(bool(res.upserted_id)), "updated": res.modified_count}
+    else:
+        return {"doc": doc, "inserted": 0, "updated": 0}
+
+
+# ------------------------------------------------------------
+# Batch parsing helpers
 # ------------------------------------------------------------
 async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
-    """Parse latest messages from a public channel and store structured posts.
-    Returns metrics and collected items. DB writes are performed only if MONGO_URL is set.
-    """
     if not channel:
         raise ValueError("channel is required")
 
@@ -448,90 +512,12 @@ async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
         try:
             async for msg in client.get_chat_history(channel, limit=limit):
                 try:
-                    text = (msg.caption or msg.text or "").strip()
-
-                    # Collect up to 3 photos
-                    photo_paths: List[str] = []
-                    if msg.media_group_id:
-                        try:
-                            grp = await client.get_media_group(chat_id=msg.chat.id, message_id=msg.id)
-                            for m in grp:
-                                if m.photo:
-                                    path = await client.download_media(m, file_name=os.path.join(IMAGES_DIR, f"{uuid.uuid4()}.jpg"))
-                                    if path:
-                                        photo_paths.append(path)
-                                    if len(photo_paths) >= 3:
-                                        break
-                            if not text:
-                                for m in grp:
-                                    if (m.caption or m.text):
-                                        text = (m.caption or m.text).strip()
-                                        break
-                        except Exception as e:
-                            logger.warning(f"Failed to process media group {msg.media_group_id}: {e}")
-                    else:
-                        if msg.photo:
-                            try:
-                                path = await client.download_media(msg, file_name=os.path.join(IMAGES_DIR, f"{uuid.uuid4()}.jpg"))
-                                if path:
-                                    photo_paths.append(path)
-                            except Exception as e:
-                                logger.warning(f"Photo download error for message {msg.id}: {e}")
-
-                    base = extract_info(text)
-
-                    # ruBERT NER enrichment if address is missing
-                    try:
-                        if not base.get("address") and text:
-                            ner = load_ner_pipeline()
-                            ents = ner(text)
-                            locs = [e["word"] for e in ents if e.get("entity_group") in {"LOC"}]
-                            if locs:
-                                base["address"] = " ".join(locs)
-                    except Exception as e:
-                        logger.warning(f"NER enrichment failed: {e}")
-
-                    coords = geocode_nominatim(base.get("address")) if base.get("address") else None
-
-                    # dynamic fields
-                    dyn = await cfg_get_schema(maybe_get_db())
-                    extras = extract_dynamic(text, dyn)
-
-                    doc = {
-                        "_id": str(uuid.uuid4()),
-                        "channel": channel,
-                        "message_id": msg.id,
-                        "date": msg.date.isoformat() if msg.date else None,
-                        "text": text or None,
-                        "photo_paths": photo_paths,
-                        "metro": base.get("metro"),
-                        "address": base.get("address"),
-                        "coords": coords,
-                        "phone": base.get("phone"),
-                        "price": base.get("price"),
-                        "currency": "RUB" if base.get("price") else None,
-                        "rooms": base.get("rooms"),
-                        "floor": base.get("floor"),
-                        "floors_total": base.get("floors_total"),
-                        "description": base.get("description"),
-                        **extras,
-                    }
-
-                    items.append(doc)
-
-                    db2 = maybe_get_db()
-                    if db2:
-                        res = await db2.posts.update_one(
-                            {"channel": channel, "message_id": msg.id},
-                            {"$set": doc},
-                            upsert=True,
-                        )
-                        if res.upserted_id:
-                            inserted += 1
-                        else:
-                            updated += res.modified_count
+                    res = await process_message(channel, msg, client, db)
+                    items.append(res["doc"])
+                    inserted += res.get("inserted", 0)
+                    updated += res.get("updated", 0)
                 except Exception as e:
-                    logger.exception(f"Message {msg.id} processing failed: {e}")
+                    logger.exception(f"Message {getattr(msg,'id',None)} processing failed: {e}")
                     errors.append(str(e))
         except RPCError as e:
             raise HTTPException(status_code=400, detail=f"Telegram error: {e}")
@@ -540,14 +526,15 @@ async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
 
 
 async def parse_new_posts(channel: str, batch_limit: int = 100) -> Dict[str, Any]:
-    """Process only new posts since last stored message id."""
     db = maybe_get_db()
     if not db:
         raise HTTPException(status_code=503, detail="MongoDB is required for watcher mode")
 
-    last_id = await state_get_last_id(db, channel)
+    await ensure_indexes(db)
 
+    last_id = await state_get_last_id(db, channel)
     client = get_pyrogram_client()
+
     inserted = 0
     updated = 0
     errors: List[str] = []
@@ -558,13 +545,12 @@ async def parse_new_posts(channel: str, batch_limit: int = 100) -> Dict[str, Any
         async for m in client.get_chat_history(channel, limit=batch_limit):
             if m.id and m.id > last_id:
                 msgs.append(m)
-        # process in chronological order
         msgs = list(sorted(msgs, key=lambda x: x.id))
         for msg in msgs:
             try:
-                res = await parse_channel(channel, limit=1)  # reuse parser on single context by id? simple approach
-                # Note: for simplicity we parse latest again; for production, extract from msg directly to avoid extra calls
-                # Update counters from DB deltas is not trivial here; we just mark last id
+                res = await process_message(channel, msg, client, db)
+                inserted += res.get("inserted", 0)
+                updated += res.get("updated", 0)
                 processed_max_id = max(processed_max_id, msg.id)
             except Exception as e:
                 errors.append(str(e))
@@ -602,7 +588,7 @@ async def watcher_loop():
 # ------------------------------------------------------------
 # FastAPI
 # ------------------------------------------------------------
-app = FastAPI(title="Telegram Rental Parser", version="2.0.0")
+app = FastAPI(title="Telegram Rental Parser", version="2.1.0")
 
 
 class ParseRequest(BaseModel):
@@ -624,6 +610,21 @@ class ChannelOne(BaseModel):
 
 class SchemaPayload(BaseModel):
     fields: List[Dict[str, Any]] = Field(default_factory=list)
+
+
+@app.on_event("startup")
+async def _maybe_start_watcher():
+    if WATCH_AUTOSTART:
+        db = maybe_get_db()
+        if db:
+            logger.info("WATCH_AUTOSTART is enabled. Starting watcher...")
+            await ensure_indexes(db)
+            global WATCH_TASK, WATCH_RUNNING
+            if not (WATCH_TASK and not WATCH_TASK.done() and WATCH_RUNNING):
+                WATCH_RUNNING = True
+                WATCH_TASK = asyncio.create_task(watcher_loop())
+        else:
+            logger.warning("WATCH_AUTOSTART is on but MongoDB is not configured. Skipping watcher start.")
 
 
 @app.get("/api/health")

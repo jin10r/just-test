@@ -20,6 +20,7 @@ services:
       - EXPORTS_DIR=/data/exports
       - WATCH_INTERVAL=60
       - PER_CHANNEL_DELAY=2.0
+      - WATCH_AUTOSTART=true
       # - TG_API_ID= # если потребуется
       # - TG_API_HASH=
       # - NOMINATIM_EMAIL=you@example.com
