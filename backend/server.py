@@ -208,10 +208,14 @@ def extract_info(text: str) -> Dict[str, Any]:
             "floors_total": None,
         }
 
-    # Metro
+    # Metro (regex + QA fallback)
     m = METRO_RE.search(text)
     if m:
         metro = m.group(1).strip().strip("-:.")
+    if not metro:
+        maybe = qa(text, "Какая станция метро?")
+        if maybe and len(maybe) <= 40:
+            metro = maybe
 
     # Phone
     p = PHONE_RE.search(text)
