@@ -177,6 +177,20 @@ def extract_floor(text: str) -> Dict[str, Optional[int]]:
     return {"floor": None, "floors_total": None}
 
 
+def qa(text: str, question: str) -> Optional[str]:
+    if not text:
+        return None
+    try:
+        qa_pipe = load_qa_pipeline()
+        res = qa_pipe(question=question, context=text)
+        ans = (res.get("answer") or "").strip()
+        if ans:
+            return ans
+    except Exception as e:
+        logger.warning(f"QA failed for '{question}': {e}")
+    return None
+
+
 def extract_info(text: str) -> Dict[str, Any]:
     metro = None
     phone = None
