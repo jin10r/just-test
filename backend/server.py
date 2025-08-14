@@ -253,7 +253,16 @@ def extract_info(text: str) -> Dict[str, Any]:
 
     # Rooms and Floor
     rooms = extract_rooms(text)
+    if rooms is None:
+        maybe_rooms = qa(text, "Сколько комнат?") or qa(text, "Количество комнат?")
+        if maybe_rooms:
+            rooms = clean_number(maybe_rooms)
+
     floor_info = extract_floor(text)
+    if floor_info["floor"] is None:
+        maybe_floor = qa(text, "Какой этаж?")
+        if maybe_floor:
+            floor_info["floor"] = clean_number(maybe_floor)
 
     # Description: remove extracted items from text roughly
     desc = text
