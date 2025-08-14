@@ -45,7 +45,8 @@ os.makedirs(SESSION_DIR, exist_ok=True)
 
 # Cache heavy models lazily
 _ner_pipeline = None
-_addr_extractor = AddrExtractor()
+_morph = MorphVocab()
+_addr_extractor = AddrExtractor(_morph)
 
 
 # ------------------------------------------------------------
