@@ -30,7 +30,7 @@ MONGO_URL = os.environ.get("MONGO_URL")
 if not MONGO_URL:
     logger.warning("MONGO_URL not set. DB writes will be skipped; data can be exported to CSV.")
 
-MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "tg_parser")  # env-driven
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "roommate_app")  # env-driven to match your DB
 
 SESSION_DIR = os.environ.get("PYROGRAM_SESSION_DIR", "/app/sessions")
 SESSION_NAME = os.environ.get("PYROGRAM_SESSION_NAME", "user")
