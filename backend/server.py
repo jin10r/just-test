@@ -797,7 +797,7 @@ async def list_posts(
     query: Dict[str, Any] = {}
     if channel:
         query["channel"] = channel
-    cursor = db.posts.find(query).sort("date", -1).limit(limit)
+    cursor = db.properties.find(query).sort("created_at", -1).limit(limit)
     items: List[Dict[str, Any]] = []
     async for item in cursor:
         item["id"] = item.pop("_id")
