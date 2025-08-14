@@ -16,7 +16,7 @@ from pyrogram.errors import RPCError
 
 # NLP: BERT NER (ruBERT tiny) and Address extraction (Natasha)
 from transformers import pipeline
-from natasha import AddrExtractor
+from natasha import AddrExtractor, MorphVocab
 
 # ------------------------------------------------------------
 # Environment & Globals
