@@ -41,6 +41,10 @@ os.makedirs(IMAGES_DIR, exist_ok=True)
 os.makedirs(SESSION_DIR, exist_ok=True)
 os.makedirs(EXPORTS_DIR, exist_ok=True)
 
+WATCH_INTERVAL = int(os.environ.get("WATCH_INTERVAL", "60"))
+PER_CHANNEL_DELAY = float(os.environ.get("PER_CHANNEL_DELAY", "2.0"))
+
+
 # Cache heavy models lazily
 _ner_pipeline = None
 _qa_pipeline = None
