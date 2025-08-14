@@ -227,8 +227,12 @@ def extract_info(text: str) -> Dict[str, Any]:
     if pr:
         price_val = clean_number(pr.group(1))
 
-    # Address via Natasha first
+    # Address via Natasha first, then QA fallback
     address = extract_address_with_natasha(text)
+    if not address:
+        maybe_addr = qa(text, "Какой адрес?") or qa(text, "Укажите адрес объекта")
+        if maybe_addr and len(maybe_addr) >= 6:
+            address = maybe_addr
 
     # Fallback: rule-based – pick line containing address markers
     if not address:
