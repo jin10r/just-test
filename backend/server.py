@@ -175,7 +175,7 @@ def extract_info(text: str) -> Dict[str, Any]:
     }
 
 
-def geocode_yandex(address: str) -> Optional[Dict[str, float]]:
+def geocode_nominatim(address: str) -> Optional[Dict[str, float]]:
     if not address:
         return None
     if not YANDEX_GEOCODER_API_KEY:
@@ -270,7 +270,7 @@ async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
                     except Exception as e:
                         logger.warning(f"NER enrichment failed: {e}")
 
-                    coords = geocode_yandex(base.get("address")) if base.get("address") else None
+                    coords = geocode_nominatim(base.get("address")) if base.get("address") else None
 
                     doc = {
                         "_id": str(uuid.uuid4()),
