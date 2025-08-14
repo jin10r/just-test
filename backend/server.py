@@ -409,7 +409,9 @@ def geocode_nominatim(address: str) -> Optional[Dict[str, float]]:
 async def ensure_indexes(db):
     if not db:
         return
+    # ensure auxiliary collection posts still exists if used elsewhere
     await db.posts.create_index([("channel", 1), ("message_id", 1)], unique=True)
+    # properties indexes are created by your init script; we can add upsert safeguards here if needed
 
 
 # ------------------------------------------------------------
