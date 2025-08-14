@@ -176,33 +176,47 @@ def extract_info(text: str) -> Dict[str, Any]:
 
 
 def geocode_nominatim(address: str) -> Optional[Dict[str, float]]:
+    """Geocode using OpenStreetMap Nominatim (no API key required).
+    Respects basic usage policy with a simple rate-limit and User-Agent header.
+    """
     if not address:
         return None
-    if not YANDEX_GEOCODER_API_KEY:
-        logger.warning("YANDEX_GEOCODER_API_KEY not configured. Skipping geocoding.")
-        return None
-    try:
-        url = "https://geocode-maps.yandex.ru/1.x/"
-        params = {
-            "apikey": YANDEX_GEOCODER_API_KEY,
-            "geocode": address,
-            "format": "json",
-            "lang": "ru_RU",
-            "rspn": 0,
-        }
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        feature_members = data.get("response", {}).get("GeoObjectCollection", {}).get("featureMember", [])
-        if not feature_members:
-            return None
-        first = feature_members[0]["GeoObject"]
-        pos = first["Point"]["pos"].split()
-        lon, lat = map(float, pos)
-        return {"lat": lat, "lon": lon}
-    except Exception as e:
-        logger.error(f"Geocoding error: {e}")
-        return None
+    # Nominatim usage policy: include identifying User-Agent and (optionally) email
+    email = os.environ.get("NOMINATIM_EMAIL")
+    headers = {
+        "User-Agent": f"tg_parser/1.0 ({email})" if email else "tg_parser/1.0 (contact: set NOMINATIM_EMAIL)",
+        "Accept-Language": "ru",
+    }
+    params = {
+        "q": address,
+        "format": "json",
+        "limit": 1,
+        "addressdetails": 1,
+    }
+    # simple retry with backoff and minimal delay to be polite
+    delay = 1.0
+    for attempt in range(3):
+        try:
+            r = requests.get("https://nominatim.openstreetmap.org/search", params=params, headers=headers, timeout=20)
+            if r.status_code == 429:
+                logger.warning("Nominatim rate limited (429). Backing off...")
+                time.sleep(delay)
+                delay *= 2
+                continue
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                return None
+            first = data[0]
+            lat = float(first.get("lat"))
+            lon = float(first.get("lon"))
+            return {"lat": lat, "lon": lon}
+        except Exception as e:
+            logger.warning(f"Nominatim request failed (attempt {attempt+1}): {e}")
+            time.sleep(delay)
+            delay *= 2
+    logger.error("Nominatim geocoding failed after retries")
+    return None
 
 
 async def ensure_indexes(db):
