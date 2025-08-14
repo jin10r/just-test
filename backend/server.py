@@ -9,7 +9,7 @@ from typing import Optional, Dict, Any, List
 import csv
 import requests
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from motor.motor_asyncio import AsyncIOMotorClient
 
 # Pyrogram (Telegram)
