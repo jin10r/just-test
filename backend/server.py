@@ -222,10 +222,14 @@ def extract_info(text: str) -> Dict[str, Any]:
     if p:
         phone = re.sub(r"\D", "", p.group(0))  # normalized digits
 
-    # Price
+    # Price (regex + QA) — извлекаем только число
     pr = PRICE_RE.search(text)
     if pr:
         price_val = clean_number(pr.group(1))
+    if price_val is None:
+        maybe_price = qa(text, "Какая цена аренды?") or qa(text, "Арендная плата в месяц?")
+        if maybe_price:
+            price_val = clean_number(maybe_price)
 
     # Address via Natasha first, then QA fallback
     address = extract_address_with_natasha(text)
