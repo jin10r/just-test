@@ -71,6 +71,22 @@ def load_ner_pipeline():
     return _ner_pipeline
 
 
+def load_qa_pipeline():
+    """Russian QA for unstructured caption parsing.
+    Prefer Russian-finetuned QA model. Falls back to multilingual XLM-R if not available.
+    """
+    global _qa_pipeline
+    if _qa_pipeline is None:
+        model_name = os.environ.get("RU_QA_MODEL", "DeepPavlov/rubert-base-cased-squad")
+        try:
+            logger.info(f"Loading QA pipeline: {model_name}")
+            _qa_pipeline = pipeline("question-answering", model=model_name)
+        except Exception as e:
+            logger.warning(f"Failed to load {model_name}, falling back to xlm-roberta-large-finetuned-russian-squad: {e}")
+            _qa_pipeline = pipeline("question-answering", model="xlm-roberta-large-finetuned-russian-squad")
+    return _qa_pipeline
+
+
 def get_pyrogram_client() -> Client:
     """Create Client using existing user .session. api_id/hash are optional.
 
