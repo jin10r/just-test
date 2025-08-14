@@ -2,12 +2,13 @@ import os
 import re
 import uuid
 import asyncio
-import time
 import logging
+import time
 from typing import Optional, Dict, Any, List
 
+import csv
 import requests
-from fastapi import FastAPI, HTTPException, Body, Query
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from motor.motor_asyncio import AsyncIOMotorClient
 
@@ -27,22 +28,18 @@ logger = logging.getLogger("tg_parser")
 
 MONGO_URL = os.environ.get("MONGO_URL")
 if not MONGO_URL:
-    # Allow running even if .env not present; user will set in production
-    logger.warning("MONGO_URL not set. Set backend/.env with MONGO_URL for persistence.")
+    logger.warning("MONGO_URL not set. DB writes will be skipped; data can be exported to CSV.")
 
-MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "tg_parser")  # env-driven per requirements
-
-YANDEX_GEOCODER_API_KEY = (
-    os.environ.get("YANDEX_GEOCODER_API_KEY")
-    or os.environ.get("YA_GEOCODER_API_KEY")
-)
+MONGO_DB_NAME = os.environ.get("MONGO_DB_NAME", "tg_parser")  # env-driven
 
 SESSION_DIR = os.environ.get("PYROGRAM_SESSION_DIR", "/app/sessions")
 SESSION_NAME = os.environ.get("PYROGRAM_SESSION_NAME", "user")
 
 IMAGES_DIR = os.environ.get("IMAGES_DIR", "/app/data/images")
+EXPORTS_DIR = os.environ.get("EXPORTS_DIR", "/app/data/exports")
 os.makedirs(IMAGES_DIR, exist_ok=True)
 os.makedirs(SESSION_DIR, exist_ok=True)
+os.makedirs(EXPORTS_DIR, exist_ok=True)
 
 # Cache heavy models lazily
 _ner_pipeline = None
@@ -54,9 +51,9 @@ _addr_extractor = AddrExtractor(_morph)
 # Utilities
 # ------------------------------------------------------------
 
-def get_db():
+def maybe_get_db():
     if not MONGO_URL:
-        raise RuntimeError("MONGO_URL is not configured")
+        return None
     client = AsyncIOMotorClient(MONGO_URL)
     return client[MONGO_DB_NAME]
 
@@ -64,7 +61,6 @@ def get_db():
 def load_ner_pipeline():
     global _ner_pipeline
     if _ner_pipeline is None:
-        # cointegrated/rubert-tiny-ner is fast and good enough
         logger.info("Loading ruBERT NER pipeline (cointegrated/rubert-tiny-ner)...")
         _ner_pipeline = pipeline(
             "token-classification",
@@ -100,19 +96,68 @@ def get_pyrogram_client() -> Client:
 PHONE_RE = re.compile(r"(\+7|8)\s*[\(\-\s]?\d{3}[\)\-\s]?\s?\d{3}[\-\s]?\d{2}[\-\s]?\d{2}")
 PRICE_RE = re.compile(r"(?:(?:цена|стоимость|арендная\s*плата)[:\s]*)?(\d[\d\s]{3,})(?:\s*(?:₽|руб(?:\.|лей|ля)?|р\.?))?", re.IGNORECASE)
 METRO_RE = re.compile(r"(?:\bм\.?|метро)\s*[:\-]?\s*([А-ЯЁа-яё\- ]{2,})")
+ROOMS_RE_NUM = re.compile(r"(\d+)\s*[- ]?(?:к(?!\w)|комнатн)\w*", re.IGNORECASE)
+# word forms: однокомнатная, двухкомнатная, трехкомнатная, четырёхкомнатная и т.п.
+ROOMS_WORDS = {
+    "однокомнат": 1,
+    "двухкомнат": 2,
+    "трехкомнат": 3,
+    "трёхкомнат": 3,
+    "четырехкомнат": 4,
+    "четырёхкомнат": 4,
+    "пятикомнат": 5,
+}
+# floor patterns: "3/9 этаж", "этаж 2/5", "на 8 этаже", "этаж: 3 из 12"
+FLOOR_PAIR_RE = re.compile(r"(\d+)\s*[/\\|]\s*(\d+)\s*этаж", re.IGNORECASE)
+FLOOR_IN_RE = re.compile(r"(?:этаж[:\s]*|на\s+)(\d+)(?:\s*(?:из|/|\\)\s*(\d+))?\s*этаж?", re.IGNORECASE)
 
 
-def clean_number(num: str) -> int:
-    return int(re.sub(r"\D", "", num)) if num else None
+def clean_number(num: str) -> Optional[int]:
+    try:
+        return int(re.sub(r"\D", "", num)) if num else None
+    except Exception:
+        return None
 
 
 def extract_address_with_natasha(text: str) -> Optional[str]:
     matches = list(_addr_extractor.find(text))
     if not matches:
         return None
-    # Choose the longest span
     best = max(matches, key=lambda m: len(m.span))
     return text[best.span.start : best.span.stop]
+
+
+def extract_rooms(text: str) -> Optional[int]:
+    if not text:
+        return None
+    m = ROOMS_RE_NUM.search(text)
+    if m:
+        return clean_number(m.group(1))
+    low = text.lower()
+    for key, val in ROOMS_WORDS.items():
+        if key in low:
+            return val
+    # patterns like "2к", "3 кк"
+    m2 = re.search(r"(\d+)\s*кк?\b", low)
+    if m2:
+        return clean_number(m2.group(1))
+    return None
+
+
+def extract_floor(text: str) -> Dict[str, Optional[int]]:
+    if not text:
+        return {"floor": None, "floors_total": None}
+    m = FLOOR_PAIR_RE.search(text)
+    if m:
+        return {"floor": clean_number(m.group(1)), "floors_total": clean_number(m.group(2))}
+    m2 = FLOOR_IN_RE.search(text)
+    if m2:
+        return {"floor": clean_number(m2.group(1)), "floors_total": clean_number(m2.group(2)) if m2.group(2) else None}
+    # sometimes "этаж 5" without word этаж after
+    m3 = re.search(r"этаж\s*(\d+)", text, re.IGNORECASE)
+    if m3:
+        return {"floor": clean_number(m3.group(1)), "floors_total": None}
+    return {"floor": None, "floors_total": None}
 
 
 def extract_info(text: str) -> Dict[str, Any]:
@@ -127,6 +172,9 @@ def extract_info(text: str) -> Dict[str, Any]:
             "phone": phone,
             "price": price_val,
             "description": None,
+            "rooms": None,
+            "floor": None,
+            "floors_total": None,
         }
 
     # Metro
@@ -154,6 +202,10 @@ def extract_info(text: str) -> Dict[str, Any]:
                 address = line.strip()
                 break
 
+    # Rooms and Floor
+    rooms = extract_rooms(text)
+    floor_info = extract_floor(text)
+
     # Description: remove extracted items from text roughly
     desc = text
     if m:
@@ -172,28 +224,24 @@ def extract_info(text: str) -> Dict[str, Any]:
         "phone": phone,
         "price": price_val,
         "description": desc or None,
+        "rooms": rooms,
+        "floor": floor_info["floor"],
+        "floors_total": floor_info["floors_total"],
     }
 
 
+# ---------- Nominatim Geocoding ----------
+
 def geocode_nominatim(address: str) -> Optional[Dict[str, float]]:
-    """Geocode using OpenStreetMap Nominatim (no API key required).
-    Respects basic usage policy with a simple rate-limit and User-Agent header.
-    """
+    """Geocode using OpenStreetMap Nominatim (no API key required)."""
     if not address:
         return None
-    # Nominatim usage policy: include identifying User-Agent and (optionally) email
     email = os.environ.get("NOMINATIM_EMAIL")
     headers = {
         "User-Agent": f"tg_parser/1.0 ({email})" if email else "tg_parser/1.0 (contact: set NOMINATIM_EMAIL)",
         "Accept-Language": "ru",
     }
-    params = {
-        "q": address,
-        "format": "json",
-        "limit": 1,
-        "addressdetails": 1,
-    }
-    # simple retry with backoff and minimal delay to be polite
+    params = {"q": address, "format": "json", "limit": 1, "addressdetails": 1}
     delay = 1.0
     for attempt in range(3):
         try:
@@ -220,15 +268,19 @@ def geocode_nominatim(address: str) -> Optional[Dict[str, float]]:
 
 
 async def ensure_indexes(db):
+    if not db:
+        return
     await db.posts.create_index([("channel", 1), ("message_id", 1)], unique=True)
 
 
 async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
-    """Parse latest messages from a public channel and store structured posts."""
+    """Parse latest messages from a public channel and store structured posts.
+    Returns metrics and collected items. DB writes are performed only if MONGO_URL is set.
+    """
     if not channel:
         raise ValueError("channel is required")
 
-    db = get_db()
+    db = maybe_get_db()
     await ensure_indexes(db)
 
     client = get_pyrogram_client()
@@ -236,25 +288,26 @@ async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
     inserted = 0
     updated = 0
     errors: List[str] = []
+    items: List[Dict[str, Any]] = []
 
     async with client:
         try:
             async for msg in client.get_chat_history(channel, limit=limit):
                 try:
-                    # Determine text
                     text = (msg.caption or msg.text or "").strip()
 
-                    # If this message belongs to media group, get the group to find first photo + caption
-                    photo_path = None
+                    # Collect up to 3 photos
+                    photo_paths: List[str] = []
                     if msg.media_group_id:
                         try:
                             grp = await client.get_media_group(chat_id=msg.chat.id, message_id=msg.id)
-                            # choose first photo in group
                             for m in grp:
                                 if m.photo:
-                                    photo_path = await client.download_media(m, file_name=os.path.join(IMAGES_DIR, f"{uuid.uuid4()}.jpg"))
-                                    break
-                            # prefer caption from any message in the group
+                                    path = await client.download_media(m, file_name=os.path.join(IMAGES_DIR, f"{uuid.uuid4()}.jpg"))
+                                    if path:
+                                        photo_paths.append(path)
+                                    if len(photo_paths) >= 3:
+                                        break
                             if not text:
                                 for m in grp:
                                     if (m.caption or m.text):
@@ -265,21 +318,21 @@ async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
                     else:
                         if msg.photo:
                             try:
-                                photo_path = await client.download_media(msg, file_name=os.path.join(IMAGES_DIR, f"{uuid.uuid4()}.jpg"))
+                                path = await client.download_media(msg, file_name=os.path.join(IMAGES_DIR, f"{uuid.uuid4()}.jpg"))
+                                if path:
+                                    photo_paths.append(path)
                             except Exception as e:
                                 logger.warning(f"Photo download error for message {msg.id}: {e}")
 
-                    # Extract parameters
                     base = extract_info(text)
 
-                    # ruBERT NER (optional enrichment) - try to find additional LOC tokens if address is missing
+                    # ruBERT NER enrichment if address is missing
                     try:
                         if not base.get("address") and text:
                             ner = load_ner_pipeline()
                             ents = ner(text)
-                            locs = [e["word"] for e in ents if e.get("entity_group") in {"LOC", "PER", "ORG", "MISC"}]
+                            locs = [e["word"] for e in ents if e.get("entity_group") in {"LOC"}]
                             if locs:
-                                # Join consecutive tokens into string, simple heuristic
                                 base["address"] = " ".join(locs)
                     except Exception as e:
                         logger.warning(f"NER enrichment failed: {e}")
@@ -292,44 +345,53 @@ async def parse_channel(channel: str, limit: int = 30) -> Dict[str, Any]:
                         "message_id": msg.id,
                         "date": msg.date.isoformat() if msg.date else None,
                         "text": text or None,
-                        "photo_path": photo_path,
+                        "photo_paths": photo_paths,
                         "metro": base.get("metro"),
                         "address": base.get("address"),
                         "coords": coords,
                         "phone": base.get("phone"),
                         "price": base.get("price"),
                         "currency": "RUB" if base.get("price") else None,
+                        "rooms": base.get("rooms"),
+                        "floor": base.get("floor"),
+                        "floors_total": base.get("floors_total"),
                         "description": base.get("description"),
                     }
 
-                    # Upsert by channel+message_id
-                    res = await db.posts.update_one(
-                        {"channel": channel, "message_id": msg.id},
-                        {"$set": doc},
-                        upsert=True,
-                    )
-                    if res.upserted_id:
-                        inserted += 1
-                    else:
-                        updated += res.modified_count
+                    items.append(doc)
+
+                    if db:
+                        res = await db.posts.update_one(
+                            {"channel": channel, "message_id": msg.id},
+                            {"$set": doc},
+                            upsert=True,
+                        )
+                        if res.upserted_id:
+                            inserted += 1
+                        else:
+                            updated += res.modified_count
                 except Exception as e:
                     logger.exception(f"Message {msg.id} processing failed: {e}")
                     errors.append(str(e))
         except RPCError as e:
             raise HTTPException(status_code=400, detail=f"Telegram error: {e}")
 
-    return {"inserted": inserted, "updated": updated, "errors": errors}
+    return {"inserted": inserted, "updated": updated, "errors": errors, "items": items}
 
 
 # ------------------------------------------------------------
 # FastAPI
 # ------------------------------------------------------------
-app = FastAPI(title="Telegram Rental Parser", version="1.0.0")
+app = FastAPI(title="Telegram Rental Parser", version="1.1.0")
 
 
 class ParseRequest(BaseModel):
     channel: str
     limit: int = 30
+
+
+class ParseToCSVRequest(ParseRequest):
+    csv_name: Optional[str] = None  # optional custom filename
 
 
 @app.get("/api/health")
@@ -340,7 +402,51 @@ async def health():
 @app.post("/api/parse")
 async def api_parse(req: ParseRequest):
     result = await parse_channel(req.channel, req.limit)
-    return result
+    # For API cleanliness, do not return raw items here to avoid huge payloads
+    return {"inserted": result["inserted"], "updated": result["updated"], "errors": result["errors"], "count": len(result["items"]) }
+
+
+@app.post("/api/parse_to_csv")
+async def api_parse_to_csv(req: ParseToCSVRequest):
+    result = await parse_channel(req.channel, req.limit)
+    items = result["items"]
+    # Prepare CSV path
+    fname = req.csv_name or f"{req.channel}_{int(time.time())}.csv"
+    csv_path = os.path.join(EXPORTS_DIR, fname)
+
+    # Columns per your specification
+    fieldnames = [
+        "channel", "message_id", "date",
+        "photos",  # up to 3 paths joined by '; '
+        "metro", "address", "price", "phone",
+        "rooms", "floor", "description"
+    ]
+
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for it in items:
+            writer.writerow({
+                "channel": it.get("channel"),
+                "message_id": it.get("message_id"),
+                "date": it.get("date"),
+                "photos": "; ".join((it.get("photo_paths") or [])[:3]),
+                "metro": it.get("metro"),
+                "address": it.get("address"),
+                "price": it.get("price"),
+                "phone": it.get("phone"),
+                "rooms": it.get("rooms"),
+                "floor": it.get("floor"),
+                "description": it.get("description"),
+            })
+
+    return {
+        "csv_path": csv_path,
+        "inserted": result["inserted"],
+        "updated": result["updated"],
+        "count": len(items),
+        "errors": result["errors"],
+    }
 
 
 @app.get("/api/posts")
@@ -348,7 +454,9 @@ async def list_posts(
     channel: Optional[str] = Query(None),
     limit: int = Query(20, ge=1, le=200)
 ):
-    db = get_db()
+    db = maybe_get_db()
+    if not db:
+        raise HTTPException(status_code=503, detail="MongoDB is not configured in this environment")
     query: Dict[str, Any] = {}
     if channel:
         query["channel"] = channel

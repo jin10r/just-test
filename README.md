@@ -1,40 +1,42 @@
 # Telegram Rental Parser (Pyrogram + ruBERT + FastAPI)
 
-This service parses Telegram channel posts (e.g. rentals in Moscow) and extracts:
-- Metro station
-- Address (with geocoding to coordinates)
-- Phone
-- Description
-- Price
-- One photo per post (downloaded)
+Парсер постов телеграм-каналов на русском языке. Извлекает:
+- до 3 фото
+- станция метро
+- адрес (с геокодированием через Nominatim)
+- цена
+- телефон
+- количество комнат
+- этаж
+- остальное описание
 
-It uses:
-- Pyrogram (works with an existing authorized user .session file)
-- ruBERT tiny NER for Russian (cointegrated/rubert-tiny-ner)
-- Natasha for address extraction
-- FastAPI API, MongoDB for storage
-- Yandex Geocoder API for coordinates
+Технологии: Pyrogram (готовая user session), ruBERT tiny NER, Natasha, FastAPI. БД: MongoDB (по env), при её отсутствии можно выгружать в CSV.
 
-## Environment variables
-- MONGO_URL: Mongo connection string (required)
-- MONGO_DB_NAME: Database name (default: tg_parser)
-- PYROGRAM_SESSION_DIR: Path to folder with the user session (default: /app/sessions)
-- PYROGRAM_SESSION_NAME: Session file base name without extension (default: user)
-- TG_API_ID / TG_API_HASH: Optional. Only used if Pyrogram requires app credentials to open the existing session
-- YANDEX_GEOCODER_API_KEY (or YA_GEOCODER_API_KEY): for geocoding
-- IMAGES_DIR: Where to save images (default: /app/data/images)
+## Переменные окружения
+- MONGO_URL — строка подключения MongoDB (если нет — запись в БД пропускается)
+- MONGO_DB_NAME — имя базы (по умолчанию tg_parser)
+- PYROGRAM_SESSION_DIR — папка с сессией (по умолчанию /app/sessions)
+- PYROGRAM_SESSION_NAME — имя файла сессии без расширения (по умолчанию user)
+- IMAGES_DIR — путь для сохранения изображений (по умолчанию /app/data/images)
+- EXPORTS_DIR — путь для CSV (по умолчанию /app/data/exports)
+- NOMINATIM_EMAIL — опционально, попадёт в User-Agent для Nominatim
+- TG_API_ID / TG_API_HASH — опционально, если Pyrogram в окружении требует app credentials
 
-## API (binds via supervisor to 0.0.0.0:8001)
+## API (префикс /api)
 - GET /api/health
 - POST /api/parse {"channel": "arendakv_msk", "limit": 30}
-- GET /api/posts?channel=arendakv_msk&limit=20
+  - возвращает {inserted, updated, count, errors}, элементы не возвращает (чтобы не грузить ответ)
+- POST /api/parse_to_csv {"channel": "arendakv_msk", "limit": 30, "csv_name": "optional.csv"}
+  - парсит, пишет CSV в EXPORTS_DIR и возвращает путь
+- GET /api/posts — читает из БД, если MONGO_URL задан
 
 ## CLI
 ```
 python3 scripts/parse_cli.py https://t.me/arendakv_msk --limit 30
 ```
 
-## Notes
-- Place your existing Pyrogram user session file at `${PYROGRAM_SESSION_DIR}/${PYROGRAM_SESSION_NAME}.session`.
-- API ID/Hash are not required if the session file allows login without them; otherwise provide TG_API_ID/TG_API_HASH as envs.
-- Yandex Geocoder key is required in production to get coordinates.
+## Сессия Pyrogram
+Положите готовый user session файл в `${PYROGRAM_SESSION_DIR}/${PYROGRAM_SESSION_NAME}.session`.
+
+## CSV формат
+Столбцы: channel, message_id, date, photos (до 3 путей, разделены "; "), metro, address, price, phone, rooms, floor, description.
