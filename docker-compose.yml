@@ -20,8 +20,8 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
-      - MONGO_URL=mongodb://mongo:27017/tg_parser
-      - MONGO_DB_NAME=tg_parser
+      - MONGO_URL=mongodb://mongo:27017/roommate_app
+      - MONGO_DB_NAME=roommate_app
       - PYROGRAM_SESSION_DIR=/sessions
       - PYROGRAM_SESSION_NAME=user
       - IMAGES_DIR=/data/images
